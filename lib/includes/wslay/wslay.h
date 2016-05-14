@@ -153,6 +153,8 @@ enum wslay_opcode {
 #define wslay_get_rsv2(rsv) ((rsv >> 1) & 1)
 #define wslay_get_rsv3(rsv) (rsv & 1)
 
+#define wslay_set_rsv1(rsv) (rsv |= (1 << 2))
+
 struct wslay_frame_iocb {
   /* 1 for fragmented final frame, 0 for otherwise */
   uint8_t fin;
@@ -521,6 +523,7 @@ struct wslay_event_msg {
   uint8_t opcode;
   const uint8_t *msg;
   size_t msg_length;
+  uint8_t rsv;
 };
 
 /*
@@ -579,6 +582,7 @@ struct wslay_event_fragmented_msg {
   union wslay_event_msg_source source;
   /* Callback function to read message data from source. */
   wslay_event_fragmented_msg_callback read_callback;
+  uint8_t rsv;
 };
 
 /*

@@ -52,6 +52,7 @@
 #include <nettle/base64.h>
 #include <nettle/sha.h>
 #include <wslay/wslay.h>
+#include <zlib.h>
 
 int create_listen_socket(const char *service)
 {
@@ -171,6 +172,20 @@ public:
       on_msg_recv_callback
     };
     wslay_event_context_server_init(&ctx_, &callbacks, this);
+
+    memset(&d_state, 0, sizeof(d_state));
+    memset(&i_state, 0, sizeof(i_state));
+
+    int r = deflateInit2(&d_state, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                           -15, 5, Z_DEFAULT_STRATEGY);
+
+    if (r != Z_OK)
+      std::cerr << "ZLIB init ERROR" << std::endl;
+
+    r = inflateInit2(&i_state, -15);
+
+    if (r != Z_OK)
+      std::cerr << "ZLIB init ERROR" << std::endl;
   }
   virtual ~EchoWebSocketHandler()
   {
@@ -232,6 +247,9 @@ public:
   {
     return 0;
   }
+
+  z_stream d_state;
+  z_stream i_state;
 private:
   int fd_;
   wslay_event_context_ptr ctx_;
@@ -271,16 +289,73 @@ ssize_t recv_callback(wslay_event_context_ptr ctx, uint8_t *data, size_t len,
   return r;
 }
 
+#define CHUNK 16384
 void on_msg_recv_callback(wslay_event_context_ptr ctx,
                           const struct wslay_event_on_msg_recv_arg *arg,
                           void *user_data)
 {
-  if(!wslay_is_ctrl_frame(arg->opcode)) {
-    struct wslay_event_msg msgarg = {
-      arg->opcode, arg->msg, arg->msg_length
-    };
-    wslay_event_queue_msg(ctx, &msgarg);
+  EchoWebSocketHandler *sv = (EchoWebSocketHandler*)user_data;
+
+  if(wslay_is_ctrl_frame(arg->opcode))
+    return;
+
+  if(!wslay_get_rsv1(arg->rsv)) {
+    std::cerr << "Not a deflated message" << std::endl;
+    return;
   }
+
+  sv->i_state.avail_in = arg->msg_length;
+  sv->i_state.next_in = (unsigned char*) arg->msg;
+
+  int r;
+  static char buffer[CHUNK];
+  std::string plain;
+
+  do {
+    sv->i_state.avail_out = CHUNK;
+    sv->i_state.next_out = (unsigned char*) buffer;
+
+    r = inflate(&sv->i_state, Z_SYNC_FLUSH);
+    assert(r != Z_STREAM_ERROR);
+    if (r == Z_NEED_DICT || r == Z_DATA_ERROR || r == Z_MEM_ERROR) {
+      std::cerr << "ZLIB inflate ERROR: " << r << std::endl;
+      return;
+    }
+
+    plain.append(buffer, CHUNK - sv->i_state.avail_out);
+
+  } while (sv->i_state.avail_out == 0);
+
+  plain = "Quote: " + plain;
+  std::cerr << "plain msg: " << plain << std::endl;
+
+  // send back in clear
+  struct wslay_event_msg plain_msg = {
+    WSLAY_TEXT_FRAME, (const uint8_t*) plain.c_str(), plain.length(), 0 };
+
+  wslay_event_queue_msg(ctx, &plain_msg);
+
+  // send again deflated
+  std::string deflated;
+
+  sv->d_state.avail_in = plain.length();
+  sv->d_state.next_in = (unsigned char *) plain.c_str();
+
+  do {
+    sv->d_state.avail_out = CHUNK;
+    sv->d_state.next_out = (unsigned char*) buffer;
+
+    r = deflate(&sv->d_state, Z_FULL_FLUSH);
+    assert(r != Z_STREAM_ERROR);
+
+    deflated.append(buffer, CHUNK - sv->d_state.avail_out);
+
+  } while (sv->d_state.avail_out == 0);
+
+  struct wslay_event_msg deflated_msg = {
+    WSLAY_TEXT_FRAME, (const uint8_t*) deflated.c_str(), deflated.length(), 4 };
+
+   wslay_event_queue_msg(ctx, &deflated_msg);
 }
 
 class HttpHandshakeSendHandler : public EventHandler {
@@ -291,6 +366,7 @@ public:
                   "Upgrade: websocket\r\n"
                   "Connection: Upgrade\r\n"
                   "Sec-WebSocket-Accept: "+accept_key+"\r\n"
+                  "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits=15\r\n"
                   "\r\n"),
       off_(0)
   {}

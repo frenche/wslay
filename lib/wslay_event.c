@@ -206,7 +206,7 @@ static int wslay_event_imsg_append_chunk(struct wslay_event_imsg *m, size_t len)
 }
 
 static int wslay_event_omsg_non_fragmented_init
-(struct wslay_event_omsg **m, uint8_t opcode,
+(struct wslay_event_omsg **m, uint8_t opcode, uint8_t rsv,
  const uint8_t *msg, size_t msg_length)
 {
   *m = (struct wslay_event_omsg*)malloc(sizeof(struct wslay_event_omsg));
@@ -216,6 +216,7 @@ static int wslay_event_omsg_non_fragmented_init
   memset(*m, 0, sizeof(struct wslay_event_omsg));
   (*m)->fin = 1;
   (*m)->opcode = opcode;
+  (*m)->rsv = rsv;
   (*m)->type = WSLAY_NON_FRAGMENTED;
   if(msg_length) {
     (*m)->data = (uint8_t*)malloc(msg_length);
@@ -230,7 +231,7 @@ static int wslay_event_omsg_non_fragmented_init
 }
 
 static int wslay_event_omsg_fragmented_init
-(struct wslay_event_omsg **m, uint8_t opcode,
+(struct wslay_event_omsg **m, uint8_t opcode, uint8_t rsv,
  const union wslay_event_msg_source source,
  wslay_event_fragmented_msg_callback read_callback)
 {
@@ -240,6 +241,7 @@ static int wslay_event_omsg_fragmented_init
   }
   memset(*m, 0, sizeof(struct wslay_event_omsg));
   (*m)->opcode = opcode;
+  (*m)->rsv = rsv;
   (*m)->type = WSLAY_FRAGMENTED;
   (*m)->source = source;
   (*m)->read_callback = read_callback;
@@ -336,11 +338,12 @@ int wslay_event_queue_msg(wslay_event_context_ptr ctx,
   if(!wslay_event_is_msg_queueable(ctx)) {
     return WSLAY_ERR_NO_MORE_MSG;
   }
-  if(wslay_is_ctrl_frame(arg->opcode) && arg->msg_length > 125) {
+  if(wslay_is_ctrl_frame(arg->opcode) &&
+     (arg->msg_length > 125 || arg->rsv != 0)) {
     return WSLAY_ERR_INVALID_ARGUMENT;
   }
   if((r = wslay_event_omsg_non_fragmented_init
-      (&omsg, arg->opcode, arg->msg, arg->msg_length)) != 0) {
+      (&omsg, arg->opcode, arg->rsv, arg->msg, arg->msg_length)) != 0) {
     return r;
   }
   if(wslay_is_ctrl_frame(arg->opcode)) {
@@ -369,7 +372,7 @@ int wslay_event_queue_fragmented_msg
     return WSLAY_ERR_INVALID_ARGUMENT;
   }
   if((r = wslay_event_omsg_fragmented_init
-      (&omsg, arg->opcode, arg->source, arg->read_callback)) != 0) {
+      (&omsg, arg->opcode, arg->rsv, arg->source, arg->read_callback)) != 0) {
     return r;
   }
   if((r = wslay_queue_push(ctx->send_queue, omsg)) != 0) {
@@ -547,8 +550,8 @@ int wslay_event_recv(wslay_event_context_ptr ctx)
     r = wslay_frame_recv(ctx->frame_ctx, &iocb);
     if(r >= 0) {
       int new_frame = 0;
-      /* We only allow rsv == 0 ATM. */
-      if(iocb.rsv != 0 ||
+      /* We only allow rsv == 0 or rsv == 1 ATM. */
+      if(!(iocb.rsv == (1 << 2) || iocb.rsv == 0) ||
          ((ctx->server && !iocb.mask) || (!ctx->server && iocb.mask))) {
         if((r = wslay_event_queue_close_wrapper
             (ctx, WSLAY_CODE_PROTOCOL_ERROR, NULL, 0)) != 0) {
@@ -608,8 +611,8 @@ int wslay_event_recv(wslay_event_context_ptr ctx)
           }
         }
       }
-      if(ctx->imsg->opcode == WSLAY_TEXT_FRAME ||
-         ctx->imsg->opcode == WSLAY_CONNECTION_CLOSE) {
+      if((!wslay_get_rsv1(iocb.rsv) && ctx->imsg->opcode == WSLAY_TEXT_FRAME)
+          || ctx->imsg->opcode == WSLAY_CONNECTION_CLOSE) {
         size_t i;
         if(ctx->imsg->opcode == WSLAY_CONNECTION_CLOSE) {
           i = 2;
@@ -815,6 +818,7 @@ int wslay_event_send(wslay_event_context_ptr ctx)
       memset(&iocb, 0, sizeof(iocb));
       iocb.fin = 1;
       iocb.opcode = ctx->omsg->opcode;
+      iocb.rsv = ctx->omsg->rsv;
       iocb.mask = ctx->server^1;
       iocb.data = ctx->omsg->data+ctx->opayloadoff;
       iocb.data_length = ctx->opayloadlen-ctx->opayloadoff;
@@ -871,6 +875,7 @@ int wslay_event_send(wslay_event_context_ptr ctx)
       memset(&iocb, 0, sizeof(iocb));
       iocb.fin = ctx->omsg->fin;
       iocb.opcode = ctx->omsg->opcode;
+      iocb.rsv = ctx->omsg->rsv;
       iocb.mask = ctx->server ? 0 : 1;
       iocb.data = ctx->obufmark;
       iocb.data_length = ctx->obuflimit-ctx->obufmark;
@@ -886,6 +891,7 @@ int wslay_event_send(wslay_event_context_ptr ctx)
             ctx->omsg = NULL;
           } else {
             ctx->omsg->opcode = WSLAY_CONTINUATION_FRAME;
+            ctx->omsg->rsv = 0;
           }
         } else {
           break;
